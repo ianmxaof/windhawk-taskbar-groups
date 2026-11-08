@@ -5,7 +5,7 @@
 // @version         0.1
 // @author          Ian
 // @include         explorer.exe
-// @compilerOptions -lpsapi -lcomctl32
+// @compilerOptions -lpsapi -lcomctl32 -lshell32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -25,9 +25,10 @@ Clicking a group intelligently focuses running apps or launches them if not runn
 
 ## Getting Started
 
-1. Configure groups in the mod settings
-2. Ctrl+Right-click on taskbar to see your groups
-3. Click a group to focus or launch apps
+1. **Configure groups in the mod settings** – Use apps you have installed (e.g. "System Tools" with `notepad.exe;calc.exe;mspaint.exe`, or "File Management" with `explorer.exe;cmd.exe`). Click **Save settings** to persist.
+2. **Click the Taskbar Groups icon in the system tray** (bottom-right near the clock) to open the group menu.
+3. Click a group name to focus running apps in that group or launch the preferred app.
+4. *(Optional)* Ctrl+Right-click on the taskbar may also open the menu on some systems.
 
 ## Future Enhancements
 
@@ -42,22 +43,22 @@ Check out the documentation
 
 // ==WindhawkModSettings==
 /*
-- group0Name: Dev
+- group0Name: System Tools
   $name: Group 1 - Name
   $description: Name for the first application group
-- group0Apps: code.exe;cursor.exe;devenv.exe
+- group0Apps: notepad.exe;calc.exe;mspaint.exe
   $name: Group 1 - Applications
   $description: Semicolon-separated list of executables
-- group0PreferredApp: code.exe
+- group0PreferredApp: notepad.exe
   $name: Group 1 - Preferred App
   $description: App to launch when group is clicked (leave empty for first app)
-- group1Name: Media
+- group1Name: File Management
   $name: Group 2 - Name
   $description: Name for the second application group
-- group1Apps: spotify.exe;vlc.exe
+- group1Apps: explorer.exe;cmd.exe
   $name: Group 2 - Applications
   $description: Semicolon-separated list of executables
-- group1PreferredApp: spotify.exe
+- group1PreferredApp: explorer.exe
   $name: Group 2 - Preferred App
   $description: App to launch when group is clicked
 */
@@ -69,6 +70,7 @@ Check out the documentation
 #include <vector>
 #include <string>
 #include <psapi.h>
+#include <shellapi.h>
 
 // Core data structures
 struct AppGroup {
@@ -90,6 +92,13 @@ struct Settings {
 
 Settings g_settings;
 HWND g_taskbarWindow = NULL;
+HWND g_trayIconWindow = NULL;  // Created and owned by the tray thread
+NOTIFYICONDATAW g_notifyIcon = {0};
+HANDLE g_trayThread = NULL;
+DWORD g_trayThreadId = 0;
+
+#define TRAY_ICON_WINDOW_CLASS L"TaskbarGroupsTrayWindow"
+#define TRAY_ICON_CALLBACK_MSG (WM_USER + 1)
 
 // Forward declarations
 void LoadSettings();
@@ -381,8 +390,10 @@ void HandleGroupAction(int groupIndex) {
 
 // Show context menu with groups
 void ShowGroupMenu(HWND hwnd) {
+    Wh_Log(L"ShowGroupMenu called with hwnd=%p", hwnd);
+    
     if (g_settings.groups.empty()) {
-        Wh_Log(L"No groups configured");
+        Wh_Log(L"Warning: No groups configured!");
         return;
     }
     
@@ -399,9 +410,11 @@ void ShowGroupMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
     
+    // Required when showing a menu from tray: set our window foreground so the menu appears
+    SetForegroundWindow(hwnd);
     int cmd = TrackPopupMenu(
         menu,
-        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN,
         pt.x,
         pt.y,
         0,
@@ -417,6 +430,120 @@ void ShowGroupMenu(HWND hwnd) {
     DestroyMenu(menu);
 }
 
+// Window procedure for the dedicated tray icon window (receives tray notifications)
+LRESULT CALLBACK TrayIconWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == TRAY_ICON_CALLBACK_MSG) {
+        Wh_Log(L"Tray icon callback! wParam=%d, lParam=%d (0x%X)", wParam, lParam, lParam);
+        
+        if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDOWN ||
+            lParam == WM_RBUTTONUP || lParam == WM_RBUTTONDOWN) {
+            const wchar_t* buttonType =
+                (lParam == WM_LBUTTONUP) ? L"Left Up" :
+                (lParam == WM_LBUTTONDOWN) ? L"Left Down" :
+                (lParam == WM_RBUTTONUP) ? L"Right Up" : L"Right Down";
+            Wh_Log(L"Tray icon click: %s, showing menu...", buttonType);
+            ShowGroupMenu(hwnd);
+        } else {
+            Wh_Log(L"Tray message (not click): lParam=0x%X", lParam);
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// Create the hidden window used for tray icon callbacks
+// Use a normal overlapped window (not message-only); the shell may not deliver
+// tray notifications to HWND_MESSAGE windows.
+BOOL CreateTrayIconWindow() {
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.lpfnWndProc = TrayIconWindowProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = TRAY_ICON_WINDOW_CLASS;
+    if (!RegisterClassExW(&wc)) {
+        Wh_Log(L"Failed to register tray window class");
+        return FALSE;
+    }
+    g_trayIconWindow = CreateWindowExW(
+        0,
+        TRAY_ICON_WINDOW_CLASS,
+        L"Taskbar Groups Tray",
+        WS_OVERLAPPED,
+        0, 0, 1, 1,
+        NULL,
+        NULL,
+        GetModuleHandle(NULL),
+        NULL
+    );
+    if (!g_trayIconWindow) {
+        Wh_Log(L"Failed to create tray icon window");
+        UnregisterClassW(TRAY_ICON_WINDOW_CLASS, GetModuleHandle(NULL));
+        return FALSE;
+    }
+    ShowWindow(g_trayIconWindow, SW_HIDE);
+    Wh_Log(L"Tray icon window created: %p", g_trayIconWindow);
+    return TRUE;
+}
+
+void DestroyTrayIconWindow() {
+    if (g_trayIconWindow) {
+        DestroyWindow(g_trayIconWindow);
+        g_trayIconWindow = NULL;
+        UnregisterClassW(TRAY_ICON_WINDOW_CLASS, GetModuleHandle(NULL));
+        Wh_Log(L"Tray icon window destroyed");
+    }
+}
+
+// System tray icon (uses g_trayIconWindow so notifications are delivered reliably)
+void CreateTrayIcon() {
+    if (!g_trayIconWindow) {
+        Wh_Log(L"Cannot create tray icon: tray window not created");
+        return;
+    }
+    g_notifyIcon.cbSize = sizeof(NOTIFYICONDATAW);
+    g_notifyIcon.hWnd = g_trayIconWindow;
+    g_notifyIcon.uID = 1;
+    g_notifyIcon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_notifyIcon.uCallbackMessage = TRAY_ICON_CALLBACK_MSG;
+    g_notifyIcon.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wcscpy_s(g_notifyIcon.szTip, L"Taskbar Groups");
+
+    if (!Shell_NotifyIconW(NIM_ADD, &g_notifyIcon)) {
+        Wh_Log(L"Shell_NotifyIconW(NIM_ADD) failed, error=%lu", GetLastError());
+    } else {
+        Wh_Log(L"System tray icon created");
+    }
+}
+
+void RemoveTrayIcon() {
+    if (g_notifyIcon.uID != 0) {
+        Shell_NotifyIconW(NIM_DELETE, &g_notifyIcon);
+        Wh_Log(L"System tray icon removed");
+        g_notifyIcon.uID = 0;
+    }
+}
+
+// Dedicated thread: creates tray window + icon and runs a message loop so tray callbacks are received
+static DWORD WINAPI TrayThreadProc(LPVOID) {
+    Wh_Log(L"Tray thread started");
+    if (!CreateTrayIconWindow()) {
+        Wh_Log(L"Tray thread: CreateTrayIconWindow failed");
+        return 1;
+    }
+    CreateTrayIcon();
+    Wh_Log(L"Tray thread: icon created, running message loop");
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        DispatchMessageW(&msg);
+    }
+
+    RemoveTrayIcon();
+    DestroyTrayIconWindow();
+    Wh_Log(L"Tray thread exiting");
+    return 0;
+}
+
 // Taskbar subclass procedure to intercept Ctrl+Right-click
 LRESULT CALLBACK TaskbarSubclassProc(
     HWND hwnd,
@@ -426,9 +553,16 @@ LRESULT CALLBACK TaskbarSubclassProc(
     UINT_PTR uIdSubclass,
     DWORD_PTR dwRefData
 ) {
+    // Log all right-button events for debugging
+    if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP) {
+        bool ctrlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        Wh_Log(L"Taskbar right-click detected! Ctrl pressed: %d", ctrlPressed);
+    }
+    
     if (msg == WM_RBUTTONDOWN) {
         // Check if Ctrl key is pressed
         if (GetKeyState(VK_CONTROL) & 0x8000) {
+            Wh_Log(L"Ctrl+Right-click detected! Showing group menu...");
             ShowGroupMenu(hwnd);
             return 0;
         }
@@ -513,27 +647,92 @@ BOOL Wh_ModInit() {
     
     LoadSettings();
     
-    // Find taskbar window
+    // Find taskbar first so we can create the tray icon on the main UI thread
+    // (tray callbacks are delivered to the thread that created the icon's window)
     g_taskbarWindow = FindWindowW(L"Shell_TrayWnd", NULL);
-    if (g_taskbarWindow) {
-        Wh_Log(L"Found taskbar window: %p", g_taskbarWindow);
-        
-        // Subclass the taskbar window to intercept Ctrl+Right-click
-        SetWindowSubclass(g_taskbarWindow, TaskbarSubclassProc, 1, 0);
-        Wh_Log(L"Taskbar window subclassed successfully");
-    } else {
+    if (!g_taskbarWindow) {
         Wh_Log(L"Warning: Could not find taskbar window");
+        return TRUE;
     }
-    
+    Wh_Log(L"Found taskbar window: %p", g_taskbarWindow);
+
+    HWND child = GetWindow(g_taskbarWindow, GW_CHILD);
+    int childIndex = 0;
+    HWND rebarChild = NULL;
+    HWND coreChild = NULL;
+
+    while (child) {
+        WCHAR className[256];
+        GetClassNameW(child, className, 256);
+        Wh_Log(L"Taskbar child %d: %p (class: %s)", childIndex, child, className);
+
+        if (_wcsicmp(className, L"ReBarWindow32") == 0) {
+            rebarChild = child;
+        } else if (_wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0 ||
+                   _wcsicmp(className, L"Windows.UI.Composition.DesktopWindowContentBridge") == 0) {
+            coreChild = child;
+        }
+
+        child = GetWindow(child, GW_HWNDNEXT);
+        childIndex++;
+    }
+
+    SetWindowSubclass(g_taskbarWindow, TaskbarSubclassProc, 1, 0);
+    Wh_Log(L"Taskbar window subclassed successfully");
+
+    if (rebarChild) {
+        SetWindowSubclass(rebarChild, TaskbarSubclassProc, 2, 0);
+        Wh_Log(L"ReBarWindow32 child subclassed: %p", rebarChild);
+    }
+
+    if (coreChild) {
+        SetWindowSubclass(coreChild, TaskbarSubclassProc, 3, 0);
+        Wh_Log(L"CoreWindow/Bridge child subclassed: %p", coreChild);
+    }
+
+    // Tray icon lives on a dedicated thread with its own message loop so shell callbacks are received
+    g_trayThread = CreateThread(NULL, 0, TrayThreadProc, NULL, 0, &g_trayThreadId);
+    if (!g_trayThread) {
+        Wh_Log(L"Failed to create tray thread, error=%lu", GetLastError());
+    } else {
+        Wh_Log(L"Tray thread created: id=%lu", g_trayThreadId);
+    }
+
     return TRUE;
 }
 
 // The mod is being unloaded, free all allocated resources.
 void Wh_ModUninit() {
     Wh_Log(L"Uninit");
-    
+
+    // Signal tray thread to quit; it removes the icon and destroys the window before exiting
+    if (g_trayThread && g_trayThreadId) {
+        PostThreadMessageW(g_trayThreadId, WM_QUIT, 0, 0);
+        if (WaitForSingleObject(g_trayThread, 5000) != WAIT_OBJECT_0) {
+            Wh_Log(L"Tray thread did not exit in time");
+        }
+        CloseHandle(g_trayThread);
+        g_trayThread = NULL;
+        g_trayThreadId = 0;
+    }
+
     if (g_taskbarWindow) {
         RemoveWindowSubclass(g_taskbarWindow, TaskbarSubclassProc, 1);
+
+        HWND child = GetWindow(g_taskbarWindow, GW_CHILD);
+        while (child) {
+            WCHAR className[256];
+            GetClassNameW(child, className, 256);
+
+            if (_wcsicmp(className, L"ReBarWindow32") == 0) {
+                RemoveWindowSubclass(child, TaskbarSubclassProc, 2);
+            } else if (_wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0 ||
+                       _wcsicmp(className, L"Windows.UI.Composition.DesktopWindowContentBridge") == 0) {
+                RemoveWindowSubclass(child, TaskbarSubclassProc, 3);
+            }
+
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
     }
 }
 
